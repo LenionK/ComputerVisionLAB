@@ -3,6 +3,25 @@ import numpy as np
 import cv2
 import os
 
+
+def _detach_inference_buffers(module):
+    """Clona eventuali tensori in 'inference mode' cachati come attributi nei moduli.
+
+    YOLO (ultralytics) calcola e mette in cache alcuni tensori (es. `anchors`,
+    `strides` nella detection head) durante le normali chiamate `model(img, ...)`,
+    che spesso avvengono in `torch.inference_mode()`. Questi tensori cache non
+    possono essere usati nel calcolo dei gradienti per gli attacchi adversarial,
+    causando l'errore "Inference tensors cannot be saved for backward".
+
+    Questa funzione attraversa ricorsivamente tutti i sotto-moduli e clona ogni
+    tensore in inference mode trovato come attributo, rendendolo un tensore
+    normale utilizzabile con autograd.
+    """
+    for m in module.modules():
+        for name, val in vars(m).items():
+            if isinstance(val, torch.Tensor) and val.is_inference():
+                setattr(m, name, val.clone())
+
 def load_frame_as_tensor(video_path, frame_index=0, imgsz=640, device="cpu"):
     """Estrae un frame dal video e lo converte in tensore PyTorch normalizzato.
 
@@ -46,6 +65,7 @@ def fgsm_attack(model, image_tensor, epsilon=0.03):
     """
     net = model.model
     net.eval()
+    _detach_inference_buffers(net)
 
     if image_tensor.grad is not None:
         image_tensor.grad.zero_()
@@ -92,6 +112,7 @@ def pgd_attack(model, image_tensor, epsilon=0.03, alpha=0.005, num_iter=10):
     """
     net = model.model
     net.eval()
+    _detach_inference_buffers(net)
 
     original = image_tensor.detach().clone()
     adv = original.clone().detach()
