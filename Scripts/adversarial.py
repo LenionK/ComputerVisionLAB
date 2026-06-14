@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import cv2
+import os
 
 def load_frame_as_tensor(video_path, frame_index=0, imgsz=640, device="cpu"):
     """Estrae un frame dal video e lo converte in tensore PyTorch normalizzato.
@@ -123,3 +124,64 @@ def tensor_to_image(t):
     """Converte un tensore (1, 3, H, W) in [0,1] in immagine numpy RGB uint8 (H, W, 3)."""
     img = t.squeeze(0).permute(1, 2, 0).cpu().numpy()
     return (img * 255).clip(0, 255).astype(np.uint8)
+
+
+def run_adversarial_video_pgd(source, output, yolo_model, epsilon=0.03, alpha=0.005, num_iter=10, conf=0.25, device="cpu"):
+    """
+    Versione corretta al 100%: Passa a YOLO direttamente il tensore PyTorch float,
+    preservando la perturbazione PGD senza le distorsioni della conversione in uint8.
+    """
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        raise IOError(f"Impossibile aprire il video sorgente: {source}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    imgsz = 640  # Dimensione nativa d'attacco
+
+    fourcc = cv2.VideoWriter_fourcc(*"avc1") 
+    writer = cv2.VideoWriter(output, fourcc, fps, (imgsz, imgsz))
+
+    print("Inizio elaborazione video (Inferenza diretta su Tensore PyTorch)...")
+    frame_count = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_count += 1
+        if frame_count % 10 == 0:
+            print(f"Elaborando frame {frame_count}...")
+
+        # 1. Prepariamo il frame a 640x640 in RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(frame_rgb, (imgsz, imgsz))
+        
+        # 2. Creiamo il tensore Float [0, 1]
+        img_tar = resized.astype(float) / 255.0
+        img_tar = img_tar.transpose(2, 0, 1)
+        image_tensor = torch.from_numpy(img_tar).unsqueeze(0).float().to(device)
+
+        # 3. Calcoliamo l'attacco PGD (restituisce un tensore float)
+        adv_tensor, _ = pgd_attack(yolo_model, image_tensor, epsilon=epsilon, alpha=alpha, num_iter=num_iter)
+
+        # 4. CRITICO: Passiamo a YOLO direttamente il TENSORE d'attacco, non l'immagine NumPy!
+        # YOLOv8 accetta tensori float [0, 1] di shape (1, 3, 640, 640)
+        results = yolo_model(adv_tensor, conf=conf, verbose=False)
+        
+        # 5. Ora prendiamo il frame modificato, lo convertiamo in formato OpenCV solo per disegnarci sopra
+        adv_img = adv_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+        adv_img = (adv_img * 255.0).astype('uint8')
+        frame_visualizzazione = cv2.cvtColor(adv_img, cv2.COLOR_RGB2BGR)
+
+        # 6. Usiamo il plot di YOLO sul frame di visualizzazione
+        # Se l'attacco sul tensore ha funzionato, results[0] conterrà zero box, quindi non disegnerà nulla!
+        results[0].orig_img = frame_visualizzazione  # Diciamo a YOLO di disegnare sopra il frame corrotto
+        annotated_frame = results[0].plot()
+
+        # Scriviamo il frame finale nel video
+        writer.write(annotated_frame)
+
+    cap.release()
+    writer.release()
+    print(f"Video d'attacco salvato con successo")
